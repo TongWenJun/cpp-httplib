@@ -219,7 +219,7 @@ public:
 
   std::function<void(const char *data, size_t data_len)> write;
   std::function<void()> done;
-  // TODO: std::function<bool()> is_alive;
+  std::function<bool()> is_writable;
 };
 
 using ContentProvider =
@@ -344,14 +344,18 @@ struct Response {
 class Stream {
 public:
   virtual ~Stream() = default;
+
+  virtual bool is_readable() const = 0;
+  virtual bool is_writable() const = 0;
+
   virtual int read(char *ptr, size_t size) = 0;
-  virtual int write(const char *ptr, size_t size1) = 0;
-  virtual int write(const char *ptr) = 0;
-  virtual int write(const std::string &s) = 0;
+  virtual int write(const char *ptr, size_t size) = 0;
   virtual std::string get_remote_addr() const = 0;
 
   template <typename... Args>
   int write_format(const char *fmt, const Args &... args);
+  int write(const char *ptr);
+  int write(const std::string &s);
 };
 
 class TaskQueue {
@@ -439,6 +443,7 @@ public:
   using Handler = std::function<void(const Request &, Response &)>;
   using HandlerWithContentReader = std::function<void(
       const Request &, Response &, const ContentReader &content_reader)>;
+  using HandlerWithStream = std::function<void(const Request &, Stream &strm)>;
 
   Server();
 
@@ -447,6 +452,7 @@ public:
   virtual bool is_valid() const;
 
   Server &Get(const char *pattern, Handler handler);
+  Server &Get(const char *pattern, HandlerWithStream handler);
   Server &Post(const char *pattern, Handler handler);
   Server &Post(const char *pattern, HandlerWithContentReader handler);
   Server &Put(const char *pattern, Handler handler);
@@ -491,8 +497,10 @@ protected:
 
 private:
   using Handlers = std::vector<std::pair<std::regex, Handler>>;
-  using HandersForContentReader =
+  using HandlersForContentReader =
       std::vector<std::pair<std::regex, HandlerWithContentReader>>;
+  using HandlersForStream =
+      std::vector<std::pair<std::regex, HandlerWithStream>>;
 
   socket_t create_server_socket(const char *host, int port,
                                 int socket_flags) const;
@@ -504,7 +512,9 @@ private:
   bool dispatch_request(Request &req, Response &res, Handlers &handlers);
   bool dispatch_request_for_content_reader(Request &req, Response &res,
                                            ContentReader content_reader,
-                                           HandersForContentReader &handlers);
+                                           HandlersForContentReader &handlers);
+  bool dispatch_request_for_stream(Request &req, Stream &strm,
+                                   HandlersForStream &handlers);
 
   bool parse_request_line(const char *s, Request &req);
   bool write_response(Stream &strm, bool last_connection, const Request &req,
@@ -531,12 +541,13 @@ private:
   std::map<std::string, std::string> file_extension_and_mimetype_map_;
   Handler file_request_handler_;
   Handlers get_handlers_;
+  HandlersForStream get_handlers_for_stream_;
   Handlers post_handlers_;
-  HandersForContentReader post_handlers_for_content_reader_;
+  HandlersForContentReader post_handlers_for_content_reader_;
   Handlers put_handlers_;
-  HandersForContentReader put_handlers_for_content_reader_;
+  HandlersForContentReader put_handlers_for_content_reader_;
   Handlers patch_handlers_;
-  HandersForContentReader patch_handlers_for_content_reader_;
+  HandlersForContentReader patch_handlers_for_content_reader_;
   Handlers delete_handlers_;
   Handlers options_handlers_;
   Handler error_handler_;
@@ -1176,6 +1187,28 @@ inline int select_read(socket_t sock, time_t sec, time_t usec) {
 #endif
 }
 
+inline int select_write(socket_t sock, time_t sec, time_t usec) {
+#ifdef CPPHTTPLIB_USE_POLL
+  struct pollfd pfd_read;
+  pfd_read.fd = sock;
+  pfd_read.events = POLLOUT;
+
+  auto timeout = static_cast<int>(sec * 1000 + usec / 1000);
+
+  return poll(&pfd_read, 1, timeout);
+#else
+  fd_set fds;
+  FD_ZERO(&fds);
+  FD_SET(sock, &fds);
+
+  timeval tv;
+  tv.tv_sec = static_cast<long>(sec);
+  tv.tv_usec = static_cast<long>(usec);
+
+  return select(static_cast<int>(sock + 1), nullptr, &fds, nullptr, &tv);
+#endif
+}
+
 inline bool wait_until_socket_is_ready(socket_t sock, time_t sec, time_t usec) {
 #ifdef CPPHTTPLIB_USE_POLL
   struct pollfd pfd_read;
@@ -1223,10 +1256,10 @@ public:
                time_t read_timeout_usec);
   ~SocketStream() override;
 
+  bool is_readable() const override;
+  bool is_writable() const override;
   int read(char *ptr, size_t size) override;
   int write(const char *ptr, size_t size) override;
-  int write(const char *ptr) override;
-  int write(const std::string &s) override;
   std::string get_remote_addr() const override;
 
 private:
@@ -1242,11 +1275,11 @@ public:
                   time_t read_timeout_usec);
   virtual ~SSLSocketStream();
 
-  virtual int read(char *ptr, size_t size);
-  virtual int write(const char *ptr, size_t size);
-  virtual int write(const char *ptr);
-  virtual int write(const std::string &s);
-  virtual std::string get_remote_addr() const;
+  bool is_readable() const override;
+  bool is_writable() const override;
+  int read(char *ptr, size_t size) override;
+  int write(const char *ptr, size_t size) override;
+  std::string get_remote_addr() const override;
 
 private:
   socket_t sock_;
@@ -1261,10 +1294,10 @@ public:
   BufferStream() = default;
   ~BufferStream() override = default;
 
+  bool is_readable() const override;
+  bool is_writable() const override;
   int read(char *ptr, size_t size) override;
   int write(const char *ptr, size_t size) override;
-  int write(const char *ptr) override;
-  int write(const std::string &s) override;
   std::string get_remote_addr() const override;
 
   const std::string &get_buffer() const;
@@ -1903,6 +1936,7 @@ inline ssize_t write_content(Stream &strm, ContentProvider content_provider,
       written_length = strm.write(d, l);
     };
     data_sink.done = [&](void) { written_length = -1; };
+    data_sink.is_writable = [&](void) { return strm.is_writable(); };
 
     content_provider(offset, end_offset - offset, data_sink);
     if (written_length < 0) { return written_length; }
@@ -1933,6 +1967,7 @@ inline ssize_t write_content_chunked(Stream &strm,
       data_available = false;
       written_length = strm.write("0\r\n\r\n");
     };
+    data_sink.is_writable = [&](void) { return strm.is_writable(); };
 
     content_provider(offset, 0, data_sink);
 
@@ -2688,6 +2723,12 @@ inline void Response::set_chunked_content_provider(
 }
 
 // Rstream implementation
+inline int Stream::write(const char *ptr) { return write(ptr, strlen(ptr)); }
+
+inline int Stream::write(const std::string &s) {
+  return write(s.data(), s.size());
+}
+
 template <typename... Args>
 inline int Stream::write_format(const char *fmt, const Args &... args) {
   std::array<char, 2048> buf;
@@ -2727,23 +2768,22 @@ inline SocketStream::SocketStream(socket_t sock, time_t read_timeout_sec,
 
 inline SocketStream::~SocketStream() {}
 
+inline bool SocketStream::is_readable() const {
+  return detail::select_read(sock_, read_timeout_sec_, read_timeout_usec_) > 0;
+}
+
+inline bool SocketStream::is_writable() const {
+  return detail::select_write(sock_, 0, 0) > 0;
+}
+
 inline int SocketStream::read(char *ptr, size_t size) {
-  if (detail::select_read(sock_, read_timeout_sec_, read_timeout_usec_) > 0) {
-    return recv(sock_, ptr, static_cast<int>(size), 0);
-  }
+  if (is_readable()) { return recv(sock_, ptr, static_cast<int>(size), 0); }
   return -1;
 }
 
 inline int SocketStream::write(const char *ptr, size_t size) {
-  return send(sock_, ptr, static_cast<int>(size), 0);
-}
-
-inline int SocketStream::write(const char *ptr) {
-  return write(ptr, strlen(ptr));
-}
-
-inline int SocketStream::write(const std::string &s) {
-  return write(s.data(), s.size());
+  if (is_writable()) { return send(sock_, ptr, static_cast<int>(size), 0); }
+  return -1;
 }
 
 inline std::string SocketStream::get_remote_addr() const {
@@ -2751,6 +2791,10 @@ inline std::string SocketStream::get_remote_addr() const {
 }
 
 // Buffer stream implementation
+inline bool BufferStream::is_readable() const { return true; }
+
+inline bool BufferStream::is_writable() const { return true; }
+
 inline int BufferStream::read(char *ptr, size_t size) {
 #if defined(_MSC_VER) && _MSC_VER < 1900
   int len_read = static_cast<int>(buffer._Copy_s(ptr, size, size, position));
@@ -2764,14 +2808,6 @@ inline int BufferStream::read(char *ptr, size_t size) {
 inline int BufferStream::write(const char *ptr, size_t size) {
   buffer.append(ptr, size);
   return static_cast<int>(size);
-}
-
-inline int BufferStream::write(const char *ptr) {
-  return write(ptr, strlen(ptr));
-}
-
-inline int BufferStream::write(const std::string &s) {
-  return write(s.data(), s.size());
 }
 
 inline std::string BufferStream::get_remote_addr() const { return ""; }
@@ -2797,6 +2833,12 @@ inline Server::~Server() {}
 
 inline Server &Server::Get(const char *pattern, Handler handler) {
   get_handlers_.push_back(std::make_pair(std::regex(pattern), handler));
+  return *this;
+}
+
+inline Server &Server::Get(const char *pattern, HandlerWithStream handler) {
+  get_handlers_for_stream_.push_back(
+      std::make_pair(std::regex(pattern), handler));
   return *this;
 }
 
@@ -3291,6 +3333,10 @@ inline bool Server::routing(Request &req, Response &res, Stream &strm,
   // File handler
   if (req.method == "GET" && handle_file_request(req, res)) { return true; }
 
+  if (dispatch_request_for_stream(req, strm, get_handlers_for_stream_)) {
+    return true;
+  }
+
   if (detail::expect_content(req)) {
     // Content reader handler
     {
@@ -3359,10 +3405,9 @@ inline bool Server::dispatch_request(Request &req, Response &res,
   return false;
 }
 
-inline bool
-Server::dispatch_request_for_content_reader(Request &req, Response &res,
-                                            ContentReader content_reader,
-                                            HandersForContentReader &handlers) {
+inline bool Server::dispatch_request_for_content_reader(
+    Request &req, Response &res, ContentReader content_reader,
+    HandlersForContentReader &handlers) {
   for (const auto &x : handlers) {
     const auto &pattern = x.first;
     const auto &handler = x.second;
@@ -3370,6 +3415,21 @@ Server::dispatch_request_for_content_reader(Request &req, Response &res,
     if (std::regex_match(req.path, req.matches, pattern)) {
       handler(req, res, content_reader);
       return true;
+    }
+  }
+  return false;
+}
+
+inline bool Server::dispatch_request_for_stream(Request &req, Stream &strm,
+                                                HandlersForStream &handlers) {
+  for (const auto &x : handlers) {
+    const auto &pattern = x.first;
+    const auto &handler = x.second;
+
+    if (std::regex_match(req.path, req.matches, pattern)) {
+      handler(req, strm);
+      // return true;
+      return false;
     }
   }
   return false;
@@ -3764,6 +3824,7 @@ inline bool Client::write_request(Stream &strm, const Request &req,
         auto written_length = strm.write(d, l);
         offset += written_length;
       };
+      data_sink.is_writable = [&](void) { return strm.is_writable(); };
 
       while (offset < end_offset) {
         req.content_provider(offset, end_offset - offset, data_sink);
@@ -3797,6 +3858,7 @@ inline std::shared_ptr<Response> Client::send_with_content_provider(
         req.body.append(data, data_len);
         offset += data_len;
       };
+      data_sink.is_writable = [&](void) { return true; };
 
       while (offset < content_length) {
         content_provider(offset, content_length - offset, data_sink);
@@ -4349,6 +4411,14 @@ inline SSLSocketStream::SSLSocketStream(socket_t sock, SSL *ssl,
 
 inline SSLSocketStream::~SSLSocketStream() {}
 
+inline bool SSLSocketStream::is_readable() const {
+  return detail::select_read(sock_, read_timeout_sec_, read_timeout_usec_) > 0;
+}
+
+inline bool SSLSocketStream::is_writable() const {
+  return detail::select_write(sock_, 0, 0) > 0;
+}
+
 inline int SSLSocketStream::read(char *ptr, size_t size) {
   if (SSL_pending(ssl_) > 0 ||
       select_read(sock_, read_timeout_sec_, read_timeout_usec_) > 0) {
@@ -4358,15 +4428,8 @@ inline int SSLSocketStream::read(char *ptr, size_t size) {
 }
 
 inline int SSLSocketStream::write(const char *ptr, size_t size) {
-  return SSL_write(ssl_, ptr, static_cast<int>(size));
-}
-
-inline int SSLSocketStream::write(const char *ptr) {
-  return write(ptr, strlen(ptr));
-}
-
-inline int SSLSocketStream::write(const std::string &s) {
-  return write(s.data(), s.size());
+  if (is_writable()) { return SSL_write(ssl_, ptr, static_cast<int>(size)); }
+  return -1;
 }
 
 inline std::string SSLSocketStream::get_remote_addr() const {
